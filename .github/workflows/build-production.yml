@@ -1,0 +1,247 @@
+name: Build production foliage database
+
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: MCD12Q2 year range, inclusive
+        required: true
+        default: "2014:2024"
+        type: string
+      cell_degrees:
+        description: Output grid size in degrees; 0.2 is the safe first production build
+        required: true
+        default: "0.2"
+        type: string
+      max_bundle_mib:
+        description: Stop before publishing to iOS if foliage.sqlite exceeds this size
+        required: true
+        default: "95"
+        type: string
+      pipeline_ref:
+        description: ios-autumn ref containing DataPipeline
+        required: true
+        default: main
+        type: string
+      publish_to_ios:
+        description: Open a data PR in Equilibriumpress/ios-autumn when the build succeeds
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: autumn-production-data
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      shard_tag: ${{ steps.tags.outputs.shard_tag }}
+      final_tag: ${{ steps.tags.outputs.final_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: matrix
+        name: Build geographic matrix
+        shell: bash
+        run: |
+          echo "matrix=$(python3 scripts/make_matrix.py)" >> "$GITHUB_OUTPUT"
+
+      - id: tags
+        name: Define release tags
+        shell: bash
+        run: |
+          echo "shard_tag=shards-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "final_tag=foliage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Create temporary shard release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tags.outputs.shard_tag }}
+        shell: bash
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Temporary foliage shards ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" \
+            --notes "Intermediate region shards for workflow run ${GITHUB_RUN_ID}. Deleted automatically after a successful final merge." \
+            --prerelease
+
+  build-shards:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Checkout private iOS pipeline
+        uses: actions/checkout@v4
+        with:
+          repository: Equilibriumpress/ios-autumn
+          ref: ${{ inputs.pipeline_ref }}
+          token: ${{ secrets.IOS_AUTUMN_TOKEN }}
+          path: _ios-autumn
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install GDAL and Python dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdal-bin libgdal-dev sqlite3 zstd
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r _ios-autumn/DataPipeline/requirements.txt
+          gdalinfo --formats | grep -q HDF4 || {
+            echo "Ubuntu GDAL has no HDF4 driver; MCD12Q2 conversion cannot continue."
+            gdalinfo --formats
+            exit 1
+          }
+
+      - name: Build ${{ matrix.id }}
+        env:
+          EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME }}
+          EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD }}
+          EARTHDATA_TOKEN: ${{ secrets.EARTHDATA_TOKEN }}
+          CDSE_S3_ACCESS_KEY: ${{ secrets.CDSE_S3_ACCESS_KEY }}
+          CDSE_S3_SECRET_KEY: ${{ secrets.CDSE_S3_SECRET_KEY }}
+        shell: bash
+        run: |
+          df -h .
+          python scripts/build_shard.py \
+            --id "${{ matrix.id }}" \
+            --bbox "${{ matrix.min_lon }}" "${{ matrix.min_lat }}" "${{ matrix.max_lon }}" "${{ matrix.max_lat }}" \
+            --years "${{ inputs.years }}" \
+            --cell-degrees "${{ inputs.cell_degrees }}" \
+            --pipeline-dir _ios-autumn/DataPipeline \
+            --output shard
+          df -h .
+
+      - name: Upload shard to temporary release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.shard_tag }}
+        shell: bash
+        run: |
+          gh release upload "$TAG" shard/${{ matrix.id }}.sqlite.zst shard/${{ matrix.id }}.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+  merge-world:
+    needs: [prepare, build-shards]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Checkout private iOS pipeline
+        uses: actions/checkout@v4
+        with:
+          repository: Equilibriumpress/ios-autumn
+          ref: ${{ inputs.pipeline_ref }}
+          token: ${{ secrets.IOS_AUTUMN_TOKEN }}
+          path: _ios-autumn
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install merge dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r _ios-autumn/DataPipeline/requirements.txt
+
+      - name: Download all region shards
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.shard_tag }}
+        shell: bash
+        run: |
+          mkdir -p shards build
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sqlite.zst' --dir shards
+          count=$(find shards -name '*.sqlite.zst' | wc -l | tr -d ' ')
+          echo "Downloaded $count shards"
+          test "$count" = "126"
+
+      - name: Merge and rebuild world indexes
+        shell: bash
+        run: |
+          python scripts/merge_shards.py \
+            --shards shards \
+            --pipeline-dir _ios-autumn/DataPipeline \
+            --output build/foliage.sqlite \
+            --cell-degrees "${{ inputs.cell_degrees }}"
+
+      - name: Validate production schema
+        shell: bash
+        run: |
+          mkdir -p build/validated
+          python _ios-autumn/DataPipeline/install_ios_database.py build/foliage.sqlite build/validated
+          python _ios-autumn/DataPipeline/analyze_database.py build/foliage.sqlite --json > build/database-report.json
+          python scripts/check_bundle_size.py build/foliage.sqlite --max-mib "${{ inputs.max_bundle_mib }}"
+          sqlite3 build/foliage.sqlite 'PRAGMA integrity_check;' | grep -qx ok
+
+      - name: Publish final database release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.final_tag }}
+        shell: bash
+        run: |
+          gh release create "$TAG" \
+            build/foliage.sqlite build/foliage.json build/database-report.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Autumn Atlas foliage database ${TAG}" \
+            --notes "Worldwide offline foliage baseline built from NASA MCD12Q2 v6.1, Copernicus Global Dynamic Land Cover 100 m v3 and Copernicus DEM GLO-90. Grid: ${{ inputs.cell_degrees }} degrees. Years: ${{ inputs.years }}."
+
+      - name: Open update PR in ios-autumn
+        if: ${{ inputs.publish_to_ios }}
+        env:
+          GH_TOKEN: ${{ secrets.IOS_AUTUMN_TOKEN }}
+          BRANCH: data/foliage-${{ github.run_id }}-${{ github.run_attempt }}
+        shell: bash
+        run: |
+          cp build/foliage.sqlite _ios-autumn/ios/RouteCinematic/foliage.sqlite
+          cd _ios-autumn
+          git config user.name "Autumn Data Builder"
+          git config user.email "actions@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add -f ios/RouteCinematic/foliage.sqlite
+          git commit -m "data: update worldwide foliage database"
+          git push origin "$BRANCH"
+          gh pr create \
+            --repo Equilibriumpress/ios-autumn \
+            --base main \
+            --head "$BRANCH" \
+            --title "Data: update worldwide foliage database" \
+            --body "Automated worldwide foliage.sqlite build from Equilibriumpress/autumn-data-builder run ${{ github.run_id }}. The builder passed schema-v2 validation, SQLite integrity checking and the ${{ inputs.max_bundle_mib }} MiB bundle-size gate."
+
+      - name: Remove temporary shard release
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.shard_tag }}
+        shell: bash
+        run: |
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag -y
