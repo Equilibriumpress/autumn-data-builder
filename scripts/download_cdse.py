@@ -3,20 +3,41 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 import boto3
 import requests
+from botocore.config import Config
 
 STAC = "https://stac.dataspace.copernicus.eu/v1"
 S3_ENDPOINT = "https://eodata.dataspace.copernicus.eu"
 
 
+def request(method: str, url: str, **kwargs) -> requests.Response:
+    last_error: Exception | None = None
+    for attempt in range(1, 7):
+        try:
+            response = requests.request(method, url, **kwargs)
+            if response.status_code == 429 or response.status_code >= 500:
+                raise requests.HTTPError(f"HTTP {response.status_code}", response=response)
+            response.raise_for_status()
+            return response
+        except (requests.RequestException, OSError) as exc:
+            last_error = exc
+            if attempt == 6:
+                raise
+            retry_after = getattr(getattr(exc, "response", None), "headers", {}).get("Retry-After")
+            delay = int(retry_after) if retry_after and retry_after.isdigit() else min(90, 5 * (2 ** (attempt - 1)))
+            print(f"CDSE HTTP retry {attempt}/6 in {delay}s: {exc}", file=sys.stderr, flush=True)
+            time.sleep(delay)
+    raise RuntimeError(f"CDSE request failed: {last_error}")
+
+
 def discover_collection(title_contains: str) -> str:
-    response = requests.get(f"{STAC}/collections", timeout=60)
-    response.raise_for_status()
-    collections = response.json().get("collections", [])
+    collections = request("GET", f"{STAC}/collections", timeout=60).json().get("collections", [])
     matches = [item for item in collections if title_contains.lower() in item.get("title", "").lower()]
     if not matches:
         raise RuntimeError(f"No CDSE STAC collection title contains: {title_contains}")
@@ -32,8 +53,7 @@ def search_items(collection: str, bbox: list[float], datetime: str | None = None
     body: dict[str, object] = {"collections": [collection], "bbox": bbox, "limit": 1000}
     if datetime:
         body["datetime"] = datetime
-    response = requests.post(f"{STAC}/search", json=body, timeout=120)
-    response.raise_for_status()
+    response = request("POST", f"{STAC}/search", json=body, timeout=120)
     payload = response.json()
     features = list(payload.get("features", []))
     while True:
@@ -42,10 +62,9 @@ def search_items(collection: str, bbox: list[float], datetime: str | None = None
             break
         method = next_link.get("method", "GET").upper()
         if method == "POST":
-            response = requests.post(next_link["href"], json=next_link.get("body", body), timeout=120)
+            response = request("POST", next_link["href"], json=next_link.get("body", body), timeout=120)
         else:
-            response = requests.get(next_link["href"], timeout=120)
-        response.raise_for_status()
+            response = request("GET", next_link["href"], timeout=120)
         payload = response.json()
         features.extend(payload.get("features", []))
     return features
@@ -86,6 +105,11 @@ def make_client():
         aws_access_key_id=access,
         aws_secret_access_key=secret,
         region_name="default",
+        config=Config(
+            retries={"max_attempts": 10, "mode": "adaptive"},
+            connect_timeout=30,
+            read_timeout=180,
+        ),
     )
 
 
@@ -98,7 +122,22 @@ def download_s3(client, href: str, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and target.stat().st_size > 0:
         return
-    client.download_file(bucket, key, str(target))
+    part = target.with_suffix(target.suffix + ".part")
+    for attempt in range(1, 7):
+        try:
+            part.unlink(missing_ok=True)
+            client.download_file(bucket, key, str(part))
+            if not part.exists() or part.stat().st_size == 0:
+                raise RuntimeError(f"Downloaded empty S3 object: {href}")
+            part.replace(target)
+            return
+        except Exception as exc:
+            part.unlink(missing_ok=True)
+            if attempt == 6:
+                raise
+            delay = min(90, 5 * (2 ** (attempt - 1)))
+            print(f"CDSE S3 retry {attempt}/6 in {delay}s: {exc}", file=sys.stderr, flush=True)
+            time.sleep(delay)
 
 
 def download_landcover(bbox: list[float], output: Path) -> None:
@@ -112,18 +151,14 @@ def download_landcover(bbox: list[float], output: Path) -> None:
         item_id = item.get("id", "item").replace("/", "_")
         for band in tuple(counts):
             wanted = normalize_token(band)
-            match = next(
-                ((key, asset) for key, asset in item.get("assets", {}).items() if wanted in asset_text(key, asset)),
-                None,
-            )
+            match = next(((key, asset) for key, asset in item.get("assets", {}).items() if wanted in asset_text(key, asset)), None)
             if not match:
                 continue
             key, asset = match
             href = find_s3_href(asset)
             if not href:
                 raise RuntimeError(f"Land-cover asset {key} has no CDSE S3 href")
-            target = output / f"{band}_{item_id}.tif"
-            download_s3(client, href, target)
+            download_s3(client, href, output / f"{band}_{item_id}.tif")
             counts[band] += 1
     missing = [name for name, count in counts.items() if count == 0]
     if missing:
@@ -145,9 +180,7 @@ def download_dem(bbox: list[float], output: Path) -> None:
             (
                 (key, asset)
                 for key, asset in assets.items()
-                if key.lower() == "data"
-                or "geotiff" in str(asset.get("type", "")).lower()
-                or "data" in asset.get("roles", [])
+                if key.lower() == "data" or "geotiff" in str(asset.get("type", "")).lower() or "data" in asset.get("roles", [])
             ),
             None,
         )

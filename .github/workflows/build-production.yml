@@ -9,7 +9,7 @@ on:
         default: "2014:2024"
         type: string
       cell_degrees:
-        description: Output grid size in degrees; 0.2 is the safe first production build
+        description: Output grid size in degrees
         required: true
         default: "0.2"
         type: string
@@ -22,6 +22,11 @@ on:
         description: ios-autumn ref containing DataPipeline
         required: true
         default: main
+        type: string
+      cache_version:
+        description: Bump only when the MODIS reduction algorithm changes
+        required: true
+        default: v2
         type: string
       publish_to_ios:
         description: Open a data PR in Equilibriumpress/ios-autumn when the build succeeds
@@ -40,46 +45,266 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-      shard_tag: ${{ steps.tags.outputs.shard_tag }}
+      modis_matrix: ${{ steps.matrix.outputs.matrix }}
+      modis_count: ${{ steps.matrix.outputs.count }}
+      modis_tag: ${{ steps.tags.outputs.modis_tag }}
+      work_tag: ${{ steps.tags.outputs.work_tag }}
       final_tag: ${{ steps.tags.outputs.final_tag }}
     steps:
       - uses: actions/checkout@v4
 
       - id: matrix
-        name: Build geographic matrix
+        name: Discover native MODIS tile groups
+        env:
+          YEARS: ${{ inputs.years }}
         shell: bash
         run: |
-          echo "matrix=$(python3 scripts/make_matrix.py)" >> "$GITHUB_OUTPUT"
+          reference_year=$(python3 - <<'PY'
+          import os
+          value = os.environ['YEARS']
+          if ':' in value:
+              print(value.split(':', 1)[1])
+          else:
+              print(value.split(',')[-1])
+          PY
+          )
+          python3 scripts/discover_modis_matrix.py \
+            --year "$reference_year" \
+            --lat-min -60 --lat-max 80 \
+            --group-size 2 \
+            --output modis-matrix.json >/dev/null
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          p=json.load(open('modis-matrix.json'))
+          print('matrix='+json.dumps({'include':p['include']}, separators=(',',':')))
+          print('count='+str(p['groupCount']))
+          print(f"Discovered {p['tileCount']} MODIS tiles in {p['groupCount']} groups", file=__import__('sys').stderr)
+          PY
 
       - id: tags
-        name: Define release tags
+        name: Define cache and release tags
+        env:
+          YEARS: ${{ inputs.years }}
+          CELL: ${{ inputs.cell_degrees }}
+          CACHE_VERSION: ${{ inputs.cache_version }}
         shell: bash
         run: |
-          echo "shard_tag=shards-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
-          echo "final_tag=foliage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          years_safe=$(echo "$YEARS" | tr ':,.' '---')
+          cell_safe=$(echo "$CELL" | tr '.' 'p')
+          echo "modis_tag=modis-${CACHE_VERSION}-${years_safe}-c${cell_safe}" >> "$GITHUB_OUTPUT"
+          echo "work_tag=work-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "final_tag=foliage-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
 
-      - name: Create temporary shard release
+      - name: Create resumable releases
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.tags.outputs.shard_tag }}
+          MODIS_TAG: ${{ steps.tags.outputs.modis_tag }}
+          WORK_TAG: ${{ steps.tags.outputs.work_tag }}
         shell: bash
         run: |
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Temporary foliage shards ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" \
-            --notes "Intermediate region shards for workflow run ${GITHUB_RUN_ID}. Deleted automatically after a successful final merge." \
+          if ! gh release view "$MODIS_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$MODIS_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "Permanent reduced MODIS cache ${MODIS_TAG}" \
+              --notes "Reduced MCD12Q2 observations. Safe to reuse for retries and future builds with the same years/grid/cache version." \
+              --prerelease
+          fi
+          gh release create "$WORK_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Temporary foliage work ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}" \
+            --notes "Baseline and enriched shards for this production build. Deleted after a successful final merge." \
             --prerelease
+          gh release upload "$WORK_TAG" modis-matrix.json --repo "$GITHUB_REPOSITORY" --clobber
 
-  build-shards:
+  build-modis:
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
       fail-fast: false
-      max-parallel: 6
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+      max-parallel: 12
+      matrix: ${{ fromJSON(needs.prepare.outputs.modis_matrix) }}
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - id: cache
+        name: Check permanent MODIS cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.modis_tag }}
+          ASSET: ${{ matrix.asset }}
+          TILES: ${{ matrix.tiles }}
+        shell: bash
+        run: |
+          mkdir -p cache
+          set +e
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "${ASSET}.sqlite.zst" --pattern "${ASSET}.json" --dir cache
+          status=$?
+          set -e
+          hit=false
+          if [ "$status" = 0 ] && [ -s "cache/${ASSET}.sqlite.zst" ] && [ -s "cache/${ASSET}.json" ]; then
+            if ASSET="$ASSET" TILES="$TILES" python3 - <<'PY'
+          import json, os
+          p=json.load(open(f"cache/{os.environ['ASSET']}.json"))
+          assert p['tiles'] == [x for x in os.environ['TILES'].split(',') if x]
+          PY
+            then hit=true; fi
+          fi
+          echo "hit=$hit" >> "$GITHUB_OUTPUT"
+          echo "MODIS cache hit: $hit"
+
+      - name: Checkout private iOS pipeline
+        if: steps.cache.outputs.hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: Equilibriumpress/ios-autumn
+          ref: ${{ inputs.pipeline_ref }}
+          token: ${{ secrets.IOS_AUTUMN_TOKEN }}
+          path: _ios-autumn
+          persist-credentials: false
+
+      - name: Set up Python
+        if: steps.cache.outputs.hit != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install MODIS dependencies
+        if: steps.cache.outputs.hit != 'true'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdal-bin libgdal-dev sqlite3 zstd
+          python -m pip install -r requirements.txt
+          gdalinfo --formats | grep -q HDF4 || { echo "GDAL HDF4 driver missing"; exit 1; }
+
+      - name: Build native MODIS group ${{ matrix.id }}
+        if: steps.cache.outputs.hit != 'true'
+        env:
+          EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME }}
+          EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD }}
+          EARTHDATA_TOKEN: ${{ secrets.EARTHDATA_TOKEN }}
+        shell: bash
+        run: |
+          python scripts/build_modis_group.py \
+            --id "${{ matrix.id }}" \
+            --asset "${{ matrix.asset }}" \
+            --tiles "${{ matrix.tiles }}" \
+            --years "${{ inputs.years }}" \
+            --cell-degrees "${{ inputs.cell_degrees }}" \
+            --pipeline-dir _ios-autumn/DataPipeline \
+            --output modis-output
+
+      - name: Publish MODIS group to permanent cache
+        if: steps.cache.outputs.hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.modis_tag }}
+        shell: bash
+        run: |
+          gh release upload "$TAG" \
+            "modis-output/${{ matrix.asset }}.sqlite.zst" "modis-output/${{ matrix.asset }}.json" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  merge-baseline:
+    needs: [prepare, build-modis]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    outputs:
+      enrichment_matrix: ${{ steps.partition.outputs.matrix }}
+      enrichment_count: ${{ steps.partition.outputs.count }}
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Checkout private iOS pipeline
+        uses: actions/checkout@v4
+        with:
+          repository: Equilibriumpress/ios-autumn
+          ref: ${{ inputs.pipeline_ref }}
+          token: ${{ secrets.IOS_AUTUMN_TOKEN }}
+          path: _ios-autumn
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install baseline dependency
+        run: python -m pip install zstandard==0.25.0
+
+      - name: Download exact cached MODIS groups
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODIS_TAG: ${{ needs.prepare.outputs.modis_tag }}
+          WORK_TAG: ${{ needs.prepare.outputs.work_tag }}
+        shell: bash
+        run: |
+          mkdir -p modis-shards baseline
+          gh release download "$WORK_TAG" --repo "$GITHUB_REPOSITORY" --pattern modis-matrix.json --dir .
+          python3 - <<'PY' > modis-assets.txt
+          import json
+          for item in json.load(open('modis-matrix.json'))['include']:
+              print(item['asset'])
+          PY
+          while read -r asset; do
+            gh release download "$MODIS_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern "${asset}.sqlite.zst" --dir modis-shards
+          done < modis-assets.txt
+          test "$(find modis-shards -name '*.sqlite.zst' | wc -l | tr -d ' ')" = "${{ needs.prepare.outputs.modis_count }}"
+
+      - name: Build global weighted baseline and partition it
+        env:
+          CELL: ${{ inputs.cell_degrees }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os
+          json.dump({
+            'cell_degrees': float(os.environ['CELL']),
+            'min_tree_cover': 20.0,
+            'min_deciduous_signal': 15.0,
+            'max_modis_qa': 2,
+            'min_years': 4,
+            'outlier_days': 35
+          }, open('baseline-config.json','w'))
+          PY
+          python scripts/merge_modis_baseline.py \
+            --shards modis-shards \
+            --pipeline-dir _ios-autumn/DataPipeline \
+            --config baseline-config.json \
+            --workspace baseline/world-baseline.sqlite \
+            --output baseline \
+            --matrix-output enrichment-matrix.json \
+            --step 20 --lat-min -60 --lat-max 80
+          rm -f baseline/world-baseline.sqlite baseline/world-baseline.sqlite-*
+
+      - id: partition
+        name: Publish baseline shards and matrix
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORK_TAG: ${{ needs.prepare.outputs.work_tag }}
+        shell: bash
+        run: |
+          gh release upload "$WORK_TAG" baseline/*.sqlite.zst baseline/baseline-report.json enrichment-matrix.json \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          p=json.load(open('enrichment-matrix.json'))
+          print('matrix='+json.dumps({'include':p['include']}, separators=(',',':')))
+          print('count='+str(p['shardCount']))
+          PY
+
+  enrich-shards:
+    needs: [prepare, merge-baseline]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix: ${{ fromJSON(needs.merge-baseline.outputs.enrichment_matrix) }}
     steps:
       - name: Checkout builder
         uses: actions/checkout@v4
@@ -99,51 +324,48 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install GDAL and Python dependencies
+      - name: Install Copernicus dependencies
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y gdal-bin libgdal-dev sqlite3 zstd
-          python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          python -m pip install -r _ios-autumn/DataPipeline/requirements.txt
-          gdalinfo --formats | grep -q HDF4 || {
-            echo "Ubuntu GDAL has no HDF4 driver; MCD12Q2 conversion cannot continue."
-            gdalinfo --formats
-            exit 1
-          }
 
-      - name: Build ${{ matrix.id }}
+      - name: Download baseline shard
         env:
-          EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME }}
-          EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD }}
-          EARTHDATA_TOKEN: ${{ secrets.EARTHDATA_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          WORK_TAG: ${{ needs.prepare.outputs.work_tag }}
+        shell: bash
+        run: |
+          mkdir -p baseline
+          gh release download "$WORK_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "${{ matrix.asset }}" --dir baseline
+
+      - name: Enrich ${{ matrix.id }} with Copernicus
+        env:
           CDSE_S3_ACCESS_KEY: ${{ secrets.CDSE_S3_ACCESS_KEY }}
           CDSE_S3_SECRET_KEY: ${{ secrets.CDSE_S3_SECRET_KEY }}
         shell: bash
         run: |
-          df -h .
-          python scripts/build_shard.py \
+          python scripts/enrich_baseline_shard.py \
             --id "${{ matrix.id }}" \
+            --baseline "baseline/${{ matrix.asset }}" \
             --bbox "${{ matrix.min_lon }}" "${{ matrix.min_lat }}" "${{ matrix.max_lon }}" "${{ matrix.max_lat }}" \
-            --years "${{ inputs.years }}" \
             --cell-degrees "${{ inputs.cell_degrees }}" \
             --pipeline-dir _ios-autumn/DataPipeline \
-            --output shard
-          df -h .
+            --output zone-output
 
-      - name: Upload shard to temporary release
+      - name: Upload enriched shard
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.prepare.outputs.shard_tag }}
+          WORK_TAG: ${{ needs.prepare.outputs.work_tag }}
         shell: bash
         run: |
-          gh release upload "$TAG" shard/${{ matrix.id }}.sqlite.zst shard/${{ matrix.id }}.json \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber
+          gh release upload "$WORK_TAG" zone-output/zone_${{ matrix.id }}.sqlite.zst zone-output/zone_${{ matrix.id }}.json \
+            --repo "$GITHUB_REPOSITORY" --clobber
 
   merge-world:
-    needs: [prepare, build-shards]
+    needs: [prepare, merge-baseline, enrich-shards]
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -166,26 +388,23 @@ jobs:
           cache: pip
 
       - name: Install merge dependencies
-        shell: bash
         run: |
-          python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install -r _ios-autumn/DataPipeline/requirements.txt
 
-      - name: Download all region shards
+      - name: Download all enriched shards
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.prepare.outputs.shard_tag }}
+          WORK_TAG: ${{ needs.prepare.outputs.work_tag }}
         shell: bash
         run: |
           mkdir -p shards build
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sqlite.zst' --dir shards
+          gh release download "$WORK_TAG" --repo "$GITHUB_REPOSITORY" --pattern 'zone_*.sqlite.zst' --dir shards
           count=$(find shards -name '*.sqlite.zst' | wc -l | tr -d ' ')
-          echo "Downloaded $count shards"
-          test "$count" = "126"
+          echo "Downloaded $count enriched shards"
+          test "$count" = "${{ needs.merge-baseline.outputs.enrichment_count }}"
 
       - name: Merge and rebuild world indexes
-        shell: bash
         run: |
           python scripts/merge_shards.py \
             --shards shards \
@@ -194,7 +413,6 @@ jobs:
             --cell-degrees "${{ inputs.cell_degrees }}"
 
       - name: Validate production schema
-        shell: bash
         run: |
           mkdir -p build/validated
           python _ios-autumn/DataPipeline/install_ios_database.py build/foliage.sqlite build/validated
@@ -208,40 +426,37 @@ jobs:
           TAG: ${{ needs.prepare.outputs.final_tag }}
         shell: bash
         run: |
-          gh release create "$TAG" \
-            build/foliage.sqlite build/foliage.json build/database-report.json \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release create "$TAG" build/foliage.sqlite build/foliage.json build/database-report.json \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "Autumn Atlas foliage database ${TAG}" \
-            --notes "Worldwide offline foliage baseline built from NASA MCD12Q2 v6.1, Copernicus Global Dynamic Land Cover 100 m v3 and Copernicus DEM GLO-90. Grid: ${{ inputs.cell_degrees }} degrees. Years: ${{ inputs.years }}."
+            --notes "Worldwide offline foliage baseline. Native MODIS tile cache + weighted global boundary merge; NASA MCD12Q2 v6.1, Copernicus Global Dynamic Land Cover 100 m v3 and Copernicus DEM GLO-90. Grid: ${{ inputs.cell_degrees }} degrees. Years: ${{ inputs.years }}."
 
-      - name: Open update PR in ios-autumn
+      - name: Open or update data PR in ios-autumn
         if: ${{ inputs.publish_to_ios }}
         env:
           GH_TOKEN: ${{ secrets.IOS_AUTUMN_TOKEN }}
-          BRANCH: data/foliage-${{ github.run_id }}-${{ github.run_attempt }}
+          BRANCH: data/foliage-${{ github.run_id }}
         shell: bash
         run: |
           cp build/foliage.sqlite _ios-autumn/ios/RouteCinematic/foliage.sqlite
           cd _ios-autumn
           git config user.name "Autumn Data Builder"
           git config user.email "actions@users.noreply.github.com"
-          git checkout -b "$BRANCH"
+          git checkout -B "$BRANCH"
           git add -f ios/RouteCinematic/foliage.sqlite
-          git commit -m "data: update worldwide foliage database"
-          git push origin "$BRANCH"
-          gh pr create \
-            --repo Equilibriumpress/ios-autumn \
-            --base main \
-            --head "$BRANCH" \
-            --title "Data: update worldwide foliage database" \
-            --body "Automated worldwide foliage.sqlite build from Equilibriumpress/autumn-data-builder run ${{ github.run_id }}. The builder passed schema-v2 validation, SQLite integrity checking and the ${{ inputs.max_bundle_mib }} MiB bundle-size gate."
+          git commit -m "data: update worldwide foliage database" || true
+          git push --force-with-lease origin "$BRANCH"
+          existing=$(gh pr list --repo Equilibriumpress/ios-autumn --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$existing" ]; then
+            gh pr create --repo Equilibriumpress/ios-autumn --base main --head "$BRANCH" \
+              --title "Data: update worldwide foliage database" \
+              --body "Automated worldwide foliage.sqlite build from Equilibriumpress/autumn-data-builder run ${{ github.run_id }}. Schema-v2 validation, SQLite integrity checking and the ${{ inputs.max_bundle_mib }} MiB bundle-size gate passed."
+          fi
 
-      - name: Remove temporary shard release
+      - name: Remove temporary work release
         if: ${{ success() }}
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.prepare.outputs.shard_tag }}
-        shell: bash
-        run: |
-          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag -y
+          WORK_TAG: ${{ needs.prepare.outputs.work_tag }}
+        run: gh release delete "$WORK_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag -y
