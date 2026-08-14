@@ -25,17 +25,10 @@ BANDS = (
 
 
 def normalized_band_name(value: str) -> str:
-    """Normalize GDAL/HDF spelling differences without weakening band identity."""
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
 def gdal_subdatasets(path: Path) -> list[tuple[str, str]]:
-    """Return (GDAL source name, description) pairs for an HDF/H5/NetCDF container.
-
-    GDAL versions expose subdatasets in two JSON shapes in the wild:
-    classic metadata/SUBDATASETS entries and a top-level `subdatasets` array.
-    Keep a plain-text fallback as well because distro builds can differ.
-    """
     payload = json.loads(subprocess.check_output(["gdalinfo", "-json", str(path)], text=True))
     candidates: list[tuple[str, str]] = []
 
@@ -71,8 +64,7 @@ def gdal_subdatasets(path: Path) -> list[tuple[str, str]]:
         names: dict[str, str] = {}
         descriptions: dict[str, str] = {}
         for line in text.splitlines():
-            stripped = line.strip()
-            match = re.match(r"SUBDATASET_(\d+)_(NAME|DESC)=(.*)$", stripped)
+            match = re.match(r"SUBDATASET_(\d+)_(NAME|DESC)=(.*)$", line.strip())
             if not match:
                 continue
             index, kind, value = match.groups()
@@ -83,7 +75,6 @@ def gdal_subdatasets(path: Path) -> list[tuple[str, str]]:
         for index, name in names.items():
             candidates.append((name, descriptions.get(index, "")))
 
-    # Preserve order but deduplicate names that appeared in more than one JSON shape.
     seen: set[str] = set()
     unique: list[tuple[str, str]] = []
     for name, desc in candidates:
@@ -93,10 +84,23 @@ def gdal_subdatasets(path: Path) -> list[tuple[str, str]]:
     return unique
 
 
-def resolve_band(subdatasets: list[tuple[str, str]], band: str) -> str | None:
-    target = normalized_band_name(band)
+def split_cycle_band(band: str) -> tuple[str, int]:
+    match = re.fullmatch(r"(.+)_([12])", band)
+    if not match:
+        raise ValueError(f"Expected a cycle-suffixed MODIS band, got {band}")
+    return match.group(1), int(match.group(2))
+
+
+def resolve_source(subdatasets: list[tuple[str, str]], base_band: str) -> str | None:
+    target = normalized_band_name(base_band)
     for name, desc in subdatasets:
-        if target in normalized_band_name(name) or target in normalized_band_name(desc):
+        # MCD12Q2 v6.1 exposes two vegetation cycles as raster bands inside one
+        # HDF subdataset, e.g. `Senescence` is [2400x2400x2]. Match the base SDS.
+        name_tail = name.rsplit(":", 1)[-1]
+        if normalized_band_name(name_tail) == target:
+            return name
+        desc_token = desc.split(" MCD12Q2", 1)[0].split()[-1] if desc else ""
+        if normalized_band_name(desc_token) == target:
             return name
     return None
 
@@ -108,22 +112,36 @@ def convert_hdf(path: Path, year: int, output: Path) -> None:
         raise RuntimeError(f"{path.name}: GDAL exposed no subdatasets")
 
     for band in BANDS:
-        source = resolve_band(subdatasets, band)
+        base_band, cycle = split_cycle_band(band)
+        source = resolve_source(subdatasets, base_band)
         if source is None:
             available = "\n".join(
                 f"  - {name} :: {desc}" if desc else f"  - {name}"
                 for name, desc in subdatasets
             )
             raise RuntimeError(
-                f"{path.name}: missing MODIS subdataset {band}. "
+                f"{path.name}: missing MODIS subdataset {base_band} for {band}. "
                 f"GDAL exposed {len(subdatasets)} subdatasets:\n{available}"
             )
+
+        source_info = json.loads(
+            subprocess.check_output(["gdalinfo", "-json", source], text=True)
+        )
+        raster_bands = source_info.get("bands", [])
+        if len(raster_bands) < cycle:
+            raise RuntimeError(
+                f"{path.name}: {base_band} exposes {len(raster_bands)} raster bands; "
+                f"cycle {cycle} is required for {band}"
+            )
+
         target = output / f"{year}_{stem}_{band}.tif"
         if not target.exists():
             subprocess.run(
                 [
                     "gdal_translate",
                     "-q",
+                    "-b",
+                    str(cycle),
                     "-co",
                     "TILED=YES",
                     "-co",
