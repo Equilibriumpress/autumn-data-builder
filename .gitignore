@@ -1,0 +1,10 @@
+.work/
+shard/
+shards/
+build/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.zst
+.env
+__pycache__/
