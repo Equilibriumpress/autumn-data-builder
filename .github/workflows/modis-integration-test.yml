@@ -1,0 +1,61 @@
+name: MODIS integration test
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - scripts/download_modis_year.py
+      - .github/workflows/modis-integration-test.yml
+
+permissions:
+  contents: read
+
+jobs:
+  modis-one-shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install GDAL and Python dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gdal-bin libgdal-dev
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          gdalinfo --formats | grep -q HDF4
+
+      - name: Download and convert one real MCD12Q2 tile
+        env:
+          EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME }}
+          EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD }}
+          EARTHDATA_TOKEN: ${{ secrets.EARTHDATA_TOKEN }}
+        shell: bash
+        run: |
+          python scripts/download_modis_year.py \
+            --year 2024 \
+            --bbox 5.0 52.0 5.2 52.2 \
+            --output .integration/modis
+
+          count=$(find .integration/modis/2024 -name '*.tif' | wc -l | tr -d ' ')
+          echo "Converted GeoTIFF count: $count"
+          test "$count" -ge 10
+
+          for band in Senescence_1 Senescence_2 MidGreendown_1 MidGreendown_2 Dormancy_1 Dormancy_2 EVI_Amplitude_1 EVI_Amplitude_2 QA_Overall_1 QA_Overall_2; do
+            find .integration/modis/2024 -name "*_${band}.tif" -print -quit | grep -q . || {
+              echo "Missing converted band: $band"
+              exit 1
+            }
+          done
+
+      - name: Inspect sample output
+        shell: bash
+        run: |
+          sample=$(find .integration/modis/2024 -name '*_Senescence_1.tif' | head -1)
+          gdalinfo "$sample" | sed -n '1,80p'
