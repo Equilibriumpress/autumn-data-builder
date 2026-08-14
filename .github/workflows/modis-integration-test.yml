@@ -5,17 +5,29 @@ on:
   push:
     paths:
       - scripts/download_modis_year.py
+      - scripts/discover_modis_matrix.py
+      - scripts/build_modis_group.py
       - .github/workflows/modis-integration-test.yml
 
 permissions:
   contents: read
 
 jobs:
-  modis-one-shard:
+  modis-native-group:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Checkout private iOS pipeline
+        uses: actions/checkout@v4
+        with:
+          repository: Equilibriumpress/ios-autumn
+          ref: main
+          token: ${{ secrets.IOS_AUTUMN_TOKEN }}
+          path: _ios-autumn
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -26,36 +38,47 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y gdal-bin libgdal-dev
-          python -m pip install --upgrade pip
+          sudo apt-get install -y gdal-bin libgdal-dev sqlite3 zstd
           python -m pip install -r requirements.txt
           gdalinfo --formats | grep -q HDF4
 
-      - name: Download and convert one real MCD12Q2 tile
+      - id: tile
+        name: Discover one real native MCD12Q2 tile
+        shell: bash
+        run: |
+          python scripts/discover_modis_matrix.py --year 2024 --lat-min 45 --lat-max 60 --group-size 1 --output matrix.json >/dev/null
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          item=json.load(open('matrix.json'))['include'][0]
+          print('id='+item['id'])
+          print('tiles='+item['tiles'])
+          print('asset='+item['asset'])
+          PY
+
+      - name: Build one native MODIS observation group
         env:
           EARTHDATA_USERNAME: ${{ secrets.EARTHDATA_USERNAME }}
           EARTHDATA_PASSWORD: ${{ secrets.EARTHDATA_PASSWORD }}
           EARTHDATA_TOKEN: ${{ secrets.EARTHDATA_TOKEN }}
         shell: bash
         run: |
-          python scripts/download_modis_year.py \
-            --year 2024 \
-            --bbox 5.0 52.0 5.2 52.2 \
-            --output .integration/modis
+          python scripts/build_modis_group.py \
+            --id "${{ steps.tile.outputs.id }}" \
+            --asset "${{ steps.tile.outputs.asset }}" \
+            --tiles "${{ steps.tile.outputs.tiles }}" \
+            --years 2024 \
+            --cell-degrees 0.2 \
+            --pipeline-dir _ios-autumn/DataPipeline \
+            --output .integration/output
 
-          count=$(find .integration/modis/2024 -name '*.tif' | wc -l | tr -d ' ')
-          echo "Converted GeoTIFF count: $count"
-          test "$count" -ge 10
-
-          for band in Senescence_1 Senescence_2 MidGreendown_1 MidGreendown_2 Dormancy_1 Dormancy_2 EVI_Amplitude_1 EVI_Amplitude_2 QA_Overall_1 QA_Overall_2; do
-            find .integration/modis/2024 -name "*_${band}.tif" -print -quit | grep -q . || {
-              echo "Missing converted band: $band"
-              exit 1
-            }
-          done
-
-      - name: Inspect sample output
+      - name: Validate reduced cache SQLite
+        env:
+          ASSET: ${{ steps.tile.outputs.asset }}
         shell: bash
         run: |
-          sample=$(find .integration/modis/2024 -name '*_Senescence_1.tif' | head -1)
-          gdalinfo "$sample" | sed -n '1,80p'
+          zstd -d ".integration/output/${ASSET}.sqlite.zst" -o .integration/cache.sqlite
+          count=$(sqlite3 .integration/cache.sqlite 'SELECT COUNT(*) FROM phenology_observations;')
+          echo "Native tile: ${{ steps.tile.outputs.tiles }}"
+          echo "Phenology observations: $count"
+          test "$count" -gt 0
+          sqlite3 .integration/cache.sqlite 'PRAGMA integrity_check;' | grep -qx ok
