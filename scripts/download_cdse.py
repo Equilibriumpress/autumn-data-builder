@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -50,9 +51,13 @@ def search_items(collection: str, bbox: list[float], datetime: str | None = None
     return features
 
 
+def normalize_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
 def asset_text(key: str, asset: dict) -> str:
     bands = " ".join(str(item.get("name", "")) for item in asset.get("bands", []))
-    return " ".join([key, str(asset.get("title", "")), bands]).lower()
+    return normalize_token(" ".join([key, str(asset.get("title", "")), bands]))
 
 
 def find_s3_href(asset: dict) -> str | None:
@@ -106,8 +111,9 @@ def download_landcover(bbox: list[float], output: Path) -> None:
     for item in items:
         item_id = item.get("id", "item").replace("/", "_")
         for band in tuple(counts):
+            wanted = normalize_token(band)
             match = next(
-                ((key, asset) for key, asset in item.get("assets", {}).items() if band.lower() in asset_text(key, asset)),
+                ((key, asset) for key, asset in item.get("assets", {}).items() if wanted in asset_text(key, asset)),
                 None,
             )
             if not match:
@@ -121,7 +127,8 @@ def download_landcover(bbox: list[float], output: Path) -> None:
             counts[band] += 1
     missing = [name for name, count in counts.items() if count == 0]
     if missing:
-        raise RuntimeError(f"Missing land-cover assets: {missing}")
+        available = sorted({key for item in items for key in item.get("assets", {})})
+        raise RuntimeError(f"Missing land-cover assets: {missing}. Available STAC asset keys: {available}")
     print(f"Downloaded land cover: {counts}")
 
 
