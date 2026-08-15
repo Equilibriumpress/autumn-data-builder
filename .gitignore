@@ -1,10 +1,2 @@
-.work/
-shard/
-shards/
-build/
-*.sqlite
-*.sqlite-wal
-*.sqlite-shm
-*.zst
+.DS_Store
 .env
-__pycache__/
