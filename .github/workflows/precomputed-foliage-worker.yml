@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       max_jobs:
-        description: Maximum Copernicus jobs this run
+        description: Maximum queued jobs this run
         required: false
-        default: '40'
+        default: '24'
       bootstrap_jobs:
-        description: Maximum new 1-degree bootstrap jobs to enqueue
+        description: Maximum new 5-degree discovery jobs to enqueue
         required: false
-        default: '120'
+        default: '60'
   schedule:
     - cron: '23 3 * * *'
 
@@ -28,8 +28,8 @@ jobs:
     env:
       SUPABASE_URL: ${{ secrets.AUTUMN_SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.AUTUMN_SUPABASE_SERVICE_ROLE_KEY }}
-      MAX_JOBS: ${{ inputs.max_jobs || '40' }}
-      BOOTSTRAP_JOBS: ${{ inputs.bootstrap_jobs || '120' }}
+      MAX_JOBS: ${{ inputs.max_jobs || '24' }}
+      BOOTSTRAP_JOBS: ${{ inputs.bootstrap_jobs || '60' }}
       REQUEST_DELAY_SECONDS: '1.0'
       WORKER_ID: github-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
