@@ -1,0 +1,43 @@
+name: Precomputed foliage worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_jobs:
+        description: Maximum Copernicus jobs this run
+        required: false
+        default: '40'
+      bootstrap_jobs:
+        description: Maximum new 1-degree bootstrap jobs to enqueue
+        required: false
+        default: '120'
+  schedule:
+    - cron: '23 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autumn-precomputed-foliage-worker
+  cancel-in-progress: false
+
+jobs:
+  foliage-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SUPABASE_URL: ${{ secrets.AUTUMN_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.AUTUMN_SUPABASE_SERVICE_ROLE_KEY }}
+      MAX_JOBS: ${{ inputs.max_jobs || '40' }}
+      BOOTSTRAP_JOBS: ${{ inputs.bootstrap_jobs || '120' }}
+      REQUEST_DELAY_SECONDS: '1.0'
+      WORKER_ID: github-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate configuration
+        shell: bash
+        run: |
+          test -n "$SUPABASE_URL" || { echo 'Missing AUTUMN_SUPABASE_URL'; exit 1; }
+          test -n "$SUPABASE_SERVICE_ROLE_KEY" || { echo 'Missing AUTUMN_SUPABASE_SERVICE_ROLE_KEY'; exit 1; }
+      - name: Process foliage update queue
+        run: python3 scripts/run_foliage_worker.py
