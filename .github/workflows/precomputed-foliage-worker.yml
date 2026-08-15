@@ -1,0 +1,46 @@
+name: Precomputed foliage worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_jobs:
+        description: Maximum server-side queue jobs this trigger
+        required: false
+        default: '4'
+  schedule:
+    - cron: '17 */3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autumn-precomputed-foliage-worker
+  cancel-in-progress: false
+
+jobs:
+  trigger-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SUPABASE_URL: https://iyvskpuprpqrysngvfeb.supabase.co
+      # Supabase anon JWT is intentionally public, just like the key embedded in the iOS app.
+      # The Edge Function itself caps work at 4 jobs and enforces a 150-minute database cooldown.
+      SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml5dnNrcHVwcnBxcnlzbmd2ZmViIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY2OTczOTMsImV4cCI6MjEwMjI3MzM5M30._o1L1pFYQNxe3S7iqNeV1JPINIYHM1xz4R2uYeABfos
+      MAX_JOBS: ${{ inputs.max_jobs || '4' }}
+    steps:
+      - name: Trigger server-side foliage queue
+        shell: bash
+        run: |
+          set -euo pipefail
+          max_jobs="$MAX_JOBS"
+          if ! [[ "$max_jobs" =~ ^[1-4]$ ]]; then
+            max_jobs=4
+          fi
+          response="$(curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --header "apikey: $SUPABASE_ANON_KEY" \
+            --header "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            --data "{\"maxJobs\":${max_jobs}}" \
+            "$SUPABASE_URL/functions/v1/process-foliage-queue")"
+          echo "$response"
