@@ -34,10 +34,17 @@ jobs:
       WORKER_ID: github-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
-      - name: Validate configuration
+      - name: Check configuration
+        id: config
         shell: bash
         run: |
-          test -n "$SUPABASE_URL" || { echo 'Missing AUTUMN_SUPABASE_URL'; exit 1; }
-          test -n "$SUPABASE_SERVICE_ROLE_KEY" || { echo 'Missing AUTUMN_SUPABASE_SERVICE_ROLE_KEY'; exit 1; }
+          if [[ -n "$SUPABASE_URL" && -n "$SUPABASE_SERVICE_ROLE_KEY" ]]; then
+            echo 'configured=true' >> "$GITHUB_OUTPUT"
+            echo 'Autumn Atlas worker configuration is present.'
+          else
+            echo 'configured=false' >> "$GITHUB_OUTPUT"
+            echo 'Worker skipped: configure AUTUMN_SUPABASE_URL and AUTUMN_SUPABASE_SERVICE_ROLE_KEY repository secrets.'
+          fi
       - name: Process foliage update queue
+        if: steps.config.outputs.configured == 'true'
         run: python3 scripts/run_foliage_worker.py
