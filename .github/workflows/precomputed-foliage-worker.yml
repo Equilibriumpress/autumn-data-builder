@@ -4,15 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       max_jobs:
-        description: Maximum queued jobs this run
+        description: Maximum server-side queue jobs this trigger
         required: false
-        default: '24'
-      bootstrap_jobs:
-        description: Maximum new 5-degree discovery jobs to enqueue
-        required: false
-        default: '60'
+        default: '4'
   schedule:
-    - cron: '23 3 * * *'
+    - cron: '17 */3 * * *'
 
 permissions:
   contents: read
@@ -22,29 +18,29 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  foliage-worker:
+  trigger-worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 5
     env:
-      SUPABASE_URL: ${{ secrets.AUTUMN_SUPABASE_URL }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.AUTUMN_SUPABASE_SERVICE_ROLE_KEY }}
-      MAX_JOBS: ${{ inputs.max_jobs || '24' }}
-      BOOTSTRAP_JOBS: ${{ inputs.bootstrap_jobs || '60' }}
-      REQUEST_DELAY_SECONDS: '1.0'
-      WORKER_ID: github-${{ github.run_id }}-${{ github.run_attempt }}
+      SUPABASE_URL: https://iyvskpuprpqrysngvfeb.supabase.co
+      # Supabase anon JWT is intentionally public, just like the key embedded in the iOS app.
+      # The Edge Function itself caps work at 4 jobs and enforces a 150-minute database cooldown.
+      SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml5dnNrcHVwcnBxcnlzbmd2ZmViIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY2OTczOTMsImV4cCI6MjEwMjI3MzM5M30._o1L1pFYQNxe3S7iqNeV1JPINIYHM1xz4R2uYeABfos
+      MAX_JOBS: ${{ inputs.max_jobs || '4' }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Check configuration
-        id: config
+      - name: Trigger server-side foliage queue
         shell: bash
         run: |
-          if [[ -n "$SUPABASE_URL" && -n "$SUPABASE_SERVICE_ROLE_KEY" ]]; then
-            echo 'configured=true' >> "$GITHUB_OUTPUT"
-            echo 'Autumn Atlas worker configuration is present.'
-          else
-            echo 'configured=false' >> "$GITHUB_OUTPUT"
-            echo 'Worker skipped: configure AUTUMN_SUPABASE_URL and AUTUMN_SUPABASE_SERVICE_ROLE_KEY repository secrets.'
+          set -euo pipefail
+          max_jobs="$MAX_JOBS"
+          if ! [[ "$max_jobs" =~ ^[1-4]$ ]]; then
+            max_jobs=4
           fi
-      - name: Process foliage update queue
-        if: steps.config.outputs.configured == 'true'
-        run: python3 scripts/run_foliage_worker.py
+          response="$(curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --header "apikey: $SUPABASE_ANON_KEY" \
+            --header "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            --data "{\"maxJobs\":${max_jobs}}" \
+            "$SUPABASE_URL/functions/v1/process-foliage-queue")"
+          echo "$response"
