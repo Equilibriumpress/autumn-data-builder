@@ -13,7 +13,6 @@ import socket
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -57,15 +56,18 @@ def rpc(name: str, payload: dict):
     return data
 
 
-def seed_queue() -> None:
-    rpc("enqueue_due_foliage_tiles", {"p_limit": max(MAX_JOBS * 2, 50)})
-    if BOOTSTRAP_JOBS:
-        rpc("enqueue_global_foliage_bootstrap", {"p_limit": BOOTSTRAP_JOBS})
+def prepare_pipeline() -> None:
+    rpc(
+        "prepare_daily_foliage_pipeline",
+        {
+            "p_bootstrap_limit": BOOTSTRAP_JOBS,
+            "p_due_limit": max(MAX_JOBS * 3, 100),
+        },
+    )
 
 
 def claim_jobs() -> list[dict]:
-    data = rpc("claim_foliage_jobs", {"p_worker_id": WORKER_ID, "p_limit": MAX_JOBS})
-    return data or []
+    return rpc("claim_foliage_jobs", {"p_worker_id": WORKER_ID, "p_limit": MAX_JOBS}) or []
 
 
 def foliage_score(job: dict):
@@ -96,7 +98,6 @@ def tile_from_response(job: dict, value: dict) -> dict:
             freshness = "recent"
         else:
             freshness = "stale"
-
     return {
         "cell_id": job["cell_id"],
         "resolution_degrees": job["resolution_degrees"],
@@ -175,10 +176,7 @@ def complete(job_id: int) -> None:
 
 
 def fail(job_id: int, message: str, retry_minutes: int) -> None:
-    rpc(
-        "fail_foliage_job",
-        {"p_job_id": job_id, "p_error": message[:900], "p_retry_minutes": retry_minutes},
-    )
+    rpc("fail_foliage_job", {"p_job_id": job_id, "p_error": message[:900], "p_retry_minutes": retry_minutes})
 
 
 def process(job: dict) -> str:
@@ -189,10 +187,8 @@ def process(job: dict) -> str:
         maybe_refine(job, tile)
         complete(job["id"])
         return "completed"
-
     message = json.dumps(data, ensure_ascii=False)[:900] if data is not None else f"HTTP {status}"
     lowered = message.lower()
-    # A non-forest cell is a successful classification. Do not retry it.
     if status == 404 and "not_deciduous_forest" in lowered:
         complete(job["id"])
         return "non_forest"
@@ -207,14 +203,14 @@ def process(job: dict) -> str:
 
 
 def main() -> int:
-    seed_queue()
+    prepare_pipeline()
     jobs = claim_jobs()
     print(f"worker={WORKER_ID} claimed={len(jobs)} max={MAX_JOBS}")
     counters: dict[str, int] = {}
     for index, job in enumerate(jobs, 1):
         try:
             outcome = process(job)
-        except Exception as exc:  # keep the queue recoverable
+        except Exception as exc:
             outcome = "failed"
             try:
                 fail(job["id"], str(exc), 120)
@@ -228,6 +224,7 @@ def main() -> int:
         if outcome == "rate_limited":
             print("Copernicus throttled; stopping early so the next run can resume safely.")
             break
+    rpc("refresh_foliage_aggregates", {})
     print(json.dumps(counters, sort_keys=True))
     return 0
 
